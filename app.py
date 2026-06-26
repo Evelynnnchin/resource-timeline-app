@@ -64,11 +64,10 @@ def process_data(df, view_mode):
     return df, grouped, tbc_df, period_col, threshold
 
 # ==========================================
-# 4. Sidebar Controls
+# 4. Sidebar Controls & Data Loading
 # ==========================================
 st.sidebar.title("Controls & Filters")
 
-# The crucial toggle requested for Week/Month view
 view_mode = st.sidebar.radio(
     "Select View Mode",
     ["Weekly", "Monthly"],
@@ -81,6 +80,19 @@ uploaded_file = st.sidebar.file_uploader("Upload Manpower Plan (Excel)", type=["
 # Load data (uploaded or dummy)
 if uploaded_file is not None:
     raw_df = pd.read_excel(uploaded_file)
+    
+    # Fix 1: Clean column names to remove accidental spaces from Excel
+    raw_df.columns = raw_df.columns.str.strip()
+    
+    # Fix 2: Check if required columns exist before processing
+    required_cols = ["Activity", "Line", "Role", "Assigned", "Week", "Month", "Load"]
+    missing_cols = [col for col in required_cols if col not in raw_df.columns]
+    
+    if missing_cols:
+        st.error(f"⚠️ **Upload Error:** Your Excel file is missing the following required columns: `{', '.join(missing_cols)}`")
+        st.info(f"Please ensure your headers exactly match: `{', '.join(required_cols)}` (Check for typos or alternate names).")
+        st.stop()  # Gracefully stops the app here instead of crashing
+        
 else:
     raw_df = generate_dummy_data()
     st.sidebar.info("Currently displaying synthetic demo data. Upload an Excel file to see your data.")
