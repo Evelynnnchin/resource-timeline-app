@@ -3181,7 +3181,19 @@ def parse_args():
         action="store_true",
         help="Launch the Streamlit app instead of generating static outputs.",
     )
-    return parser.parse_args()
+    args, _ = parser.parse_known_args()
+    return args
+
+
+def running_in_streamlit():
+    if st is None:
+        return False
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
 
 
 def main():
@@ -3203,4 +3215,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if running_in_streamlit():
+        run_streamlit_app()
+    else:
+        main()
