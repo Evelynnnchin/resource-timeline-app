@@ -2,6 +2,8 @@ import json
 import math
 import re
 import calendar
+import argparse
+import shutil
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from io import BytesIO
@@ -13,8 +15,14 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-import streamlit as st
-import plotly.express as px
+try:
+    import streamlit as st
+except ImportError:
+    st = None
+try:
+    import plotly.express as px
+except ImportError:
+    px = None
 
 # ==========================================
 # CONSTANTS & CONFIGURATION
@@ -244,6 +252,43 @@ def role_key(value):
     text = re.sub(r"\b\d+\b", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+def role_keys(value):
+    text = clean(value).upper()
+    if not text:
+        return []
+    keys = set()
+    if "SUBCON" in text or re.search(r"\bSC\b", text):
+        keys.add("SUBCON")
+    if "COMMS" in text or "NETWORK" in text or "RCS" in text:
+        keys.add("COMMS T&C ENGINEER")
+    if "TRAIN" in text:
+        keys.add("TRAIN T&C ENGINEER")
+    if "CSF" in text:
+        keys.add("CSF T&C ENGINEER")
+    if "SIG" in text or "IXL" in text:
+        keys.add("SIG T&C ENGINEER")
+    if "ATS" in text:
+        keys.add("ATS T&C ENGINEER")
+    if "ATC" in text:
+        keys.add("ATC T&C ENGINEER")
+    if "MANAGER" in text:
+        keys.add("MANAGER")
+    if "COORDINATOR" in text:
+        keys.add("COORDINATOR")
+    if "DESIGN" in text:
+        keys.add("DESIGN ENGINEER")
+    if not keys:
+        single = role_key(value)
+        if single:
+            keys.add(single)
+    return sorted(keys)
+
+def preferred_company_for_role(value):
+    keys = set(role_keys(value))
+    if "SUBCON" in keys:
+        return "SC"
+    return "Siemens" if keys else ""
 
 def normalise_company_type(value):
     text = clean(value).upper()
@@ -930,37 +975,69 @@ def load_status(load, threshold):
 
 def make_people_roster(manpower, resources=None):
     people = {}
+
+    def ensure_person(name):
+        key = clean(name).upper()
+        if key not in people:
+            people[key] = {
+                "name": clean(name),
+                "role": "",
+                "roleKey": "",
+                "roleKeys": [],
+                "company": "",
+                "maxWeeklyLoad": 1.0,
+                "lines": set(),
+            }
+        return people[key]
+
     if not manpower.empty:
         for _, row in manpower.iterrows():
             name = clean(row.get("Name", ""))
             if not name or is_tbc_name(name):
                 continue
             max_load = to_number(row.get("Max Weekly Load", 1.0))
-            people[name.upper()] = {
-                "name": name,
-                "role": clean(row.get("Role", "")),
-                "roleKey": role_key(row.get("Role", "")),
-                "company": normalise_company_type(row.get("Company", "")),
-                "maxWeeklyLoad": max_load if max_load is not None else 1.0,
-            }
+            person = ensure_person(name)
+            role = clean(row.get("Role", ""))
+            if role:
+                person["role"] = role
+                person["roleKey"] = role_key(role)
+                person["roleKeys"] = role_keys(role)
+            person["company"] = normalise_company_type(row.get("Company", ""))
+            person["maxWeeklyLoad"] = max_load if max_load is not None else 1.0
+            line = normalise_line(row.get("Line", "")) or clean(row.get("Line", "")).upper()
+            if line and line != "ALL":
+                person["lines"].add(line)
 
     if resources is not None and not resources.empty:
         for _, row in resources.iterrows():
             name = clean(row.get("Assigned Name", ""))
             if not name or is_tbc_name(name):
                 continue
-            key = name.upper()
-            current = people.get(key, {})
+            current = ensure_person(name)
             inferred_role = clean(row.get("Role", ""))
-            people[key] = {
-                "name": name,
-                "role": current.get("role") or inferred_role,
-                "roleKey": current.get("roleKey") or role_key(inferred_role),
-                "company": current.get("company") or normalise_company_type(row.get("Company", "")),
-                "maxWeeklyLoad": current.get("maxWeeklyLoad") or 1.0,
-            }
+            if inferred_role and not current.get("role"):
+                current["role"] = inferred_role
+                current["roleKey"] = role_key(inferred_role)
+                current["roleKeys"] = role_keys(inferred_role)
+            if not current.get("company"):
+                current["company"] = normalise_company_type(row.get("Company", ""))
+            current["maxWeeklyLoad"] = current.get("maxWeeklyLoad") or 1.0
+            line = normalise_line(row.get("Line", "")) or clean(row.get("Line", "")).upper()
+            if line:
+                current["lines"].add(line)
 
-    return sorted(people.values(), key=lambda row: row["name"].upper())
+    roster = []
+    for person in people.values():
+        lines = sorted(person.pop("lines", set()))
+        person["lines"] = lines
+        person["line"] = ", ".join(lines)
+        person["roleKeys"] = person.get("roleKeys") or role_keys(person.get("role", ""))
+        if not person.get("roleKey") and person["roleKeys"]:
+            person["roleKey"] = person["roleKeys"][0]
+        if not person.get("company"):
+            person["company"] = "Unknown"
+        roster.append(person)
+    return sorted(roster, key=lambda row: row["name"].upper())
 
 def max_load_map_from_roster(people_roster):
     return {row["name"].upper(): number(row.get("maxWeeklyLoad", 1.0), 1.0) for row in people_roster}
@@ -968,37 +1045,52 @@ def max_load_map_from_roster(people_roster):
 def suggest_issue_fix(issue, loads_by_person_period, people_roster):
     status = issue.get("status")
     role = clean(issue.get("role", ""))
-    target_role_key = role_key(role)
+    target_role_keys = set(role_keys(role))
+    target_role_label = "/".join(sorted(target_role_keys)) if target_role_keys else role
     period = issue.get("month", "")
+    period_label_text = issue.get("monthLabel") or issue.get("weekLabel") or period
     assigned = clean(issue.get("assigned", ""))
     load = number(issue.get("load", 0))
     threshold = number(issue.get("threshold", 1), 1)
     excess = number(issue.get("excessLoad", 0))
+    issue_line = clean(issue.get("line", ""))
+    issue_company = normalise_company_type(issue.get("company", ""))
+    preferred_company = preferred_company_for_role(role) or ("" if issue_company in {"TBC", "Unknown"} else issue_company)
 
     candidates = []
     for person in people_roster:
-        if target_role_key and person.get("roleKey") and person.get("roleKey") != target_role_key:
+        person_role_keys = set(person.get("roleKeys") or role_keys(person.get("role", "")))
+        if target_role_keys and not (person_role_keys & target_role_keys):
             continue
         if assigned and person["name"].upper() == assigned.upper():
             continue
         current_load = loads_by_person_period.get((person["name"].upper(), period), 0.0)
         capacity = number(person.get("maxWeeklyLoad", 1.0), 1.0) - current_load
         if capacity > 1e-9:
-            candidates.append((capacity, person, current_load))
-    candidates.sort(key=lambda item: (-item[0], item[1]["name"]))
+            line_match = 1 if issue_line and issue_line in (person.get("lines") or []) else 0
+            company_match = 1 if preferred_company and normalise_company_type(person.get("company", "")) == preferred_company else 0
+            matched_roles = sorted(person_role_keys & target_role_keys) if target_role_keys else sorted(person_role_keys)
+            candidates.append((company_match, line_match, capacity, person, current_load, matched_roles))
+    candidates.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]["name"]))
 
     needed = excess if status == "Clash" else load
     if candidates:
-        capacity, person, _ = candidates[0]
+        _, _, capacity, person, _, matched_roles = candidates[0]
+        qualifier = []
+        if matched_roles:
+            qualifier.append("/".join(matched_roles))
+        if person.get("line"):
+            qualifier.append(person["line"])
+        qualifier_text = f" ({', '.join(qualifier)})" if qualifier else ""
         if capacity >= needed - 1e-9:
             action = "Assign" if status == "TBC Gap" else "Move"
-            return f"{action} {rounded(needed, 2)} load to {person['name']}."
-        return f"Split: {person['name']} can take {rounded(capacity, 2)} load; add or shift {rounded(max(needed - capacity, 0), 2)}."
+            return f"{action} {rounded(needed, 2)} load to {person['name']}{qualifier_text}; {rounded(capacity, 2)} capacity available in {period_label_text}."
+        return f"Split: {person['name']}{qualifier_text} can take {rounded(capacity, 2)} in {period_label_text}; add another {target_role_label or 'matching'} resource or shift {rounded(max(needed - capacity, 0), 2)} load."
 
     if status == "Clash":
-        return f"Add {rounded(excess, 2)} {target_role_key or role or 'matching role'} load or move activity to another week."
+        return f"No spare {target_role_label or 'matching role'} capacity found in {period_label_text}; add {rounded(excess, 2)} load or move one activity to another period."
     if status == "TBC Gap":
-        return f"Add {rounded(load, 2)} {target_role_key or role or 'matching role'} load or assign a new person."
+        return f"No spare {target_role_label or 'matching role'} capacity found in {period_label_text}; assign a new person or shift {rounded(load, 2)} load."
     if status == "Fully Loaded":
         return "OK - full weekly load."
     return f"OK - {rounded(max(threshold - load, 0), 2)} capacity remaining."
@@ -1901,11 +1993,1025 @@ def export_results_workbook(payload):
     output.seek(0)
     return output.getvalue()
 
+def json_safe(value):
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+    if isinstance(value, (str, int, bool)):
+        return value
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return str(value)
+
+
+def write_static_dashboard(payload, output_path):
+    data_json = json.dumps(json_safe(payload), ensure_ascii=False).replace("</", "<\\/")
+    html = STATIC_DASHBOARD_HTML.replace("__DASHBOARD_DATA__", data_json)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(html, encoding="utf-8")
+    return output_path
+
+
+def generate_outputs(workbook_path, output_dir):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload = build_data(workbook_path=workbook_path, source_label=Path(workbook_path).name)
+    html_path = write_static_dashboard(payload, output_dir / "tc_resource_allocation_dashboard.html")
+    report_path = output_dir / "manpower_allocation_report.xlsx"
+    report_path.write_bytes(export_results_workbook(payload))
+    code_path = output_dir / "resource_dashboard.py"
+    if Path(__file__).resolve() != code_path.resolve():
+        shutil.copy2(Path(__file__), code_path)
+    return {
+        "payload": payload,
+        "html": html_path,
+        "report": report_path,
+        "code": code_path,
+    }
+
+
+STATIC_DASHBOARD_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>T&C Resource Allocation Dashboard</title>
+  <style>
+    :root {
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --ink: #23303d;
+      --muted: #637083;
+      --line: #d8e0e8;
+      --accent: #0f766e;
+      --accent-soft: #e7f4f2;
+      --danger: #c2413b;
+      --danger-soft: #fdebea;
+      --warn: #b7791f;
+      --warn-soft: #fff4db;
+      --ok: #237a4b;
+      --ok-soft: #e8f6ee;
+      --full: #2666a3;
+      --full-soft: #e8f1fa;
+      --shadow: 0 16px 36px rgba(33, 45, 58, 0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.45 "Segoe UI", Arial, sans-serif;
+    }
+    header {
+      padding: 18px 24px 14px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      position: sticky;
+      top: 0;
+      z-index: 20;
+    }
+    .title-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    h1 {
+      margin: 0;
+      font-size: 24px;
+      letter-spacing: 0;
+    }
+    .subtitle {
+      margin-top: 4px;
+      color: var(--muted);
+    }
+    main {
+      padding: 18px 24px 32px;
+      max-width: 1480px;
+      margin: 0 auto;
+    }
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(150px, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+    label {
+      display: grid;
+      gap: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+    select, input, button {
+      font: inherit;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #fff;
+      color: var(--ink);
+      min-height: 36px;
+    }
+    select, input { padding: 7px 9px; width: 100%; }
+    button {
+      padding: 7px 11px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button.primary {
+      background: var(--accent);
+      color: white;
+      border-color: var(--accent);
+    }
+    button.ghost {
+      background: #fff;
+    }
+    .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: end;
+    }
+    .grid {
+      display: grid;
+      gap: 14px;
+    }
+    .kpis {
+      grid-template-columns: repeat(6, minmax(130px, 1fr));
+      margin-bottom: 14px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 14px;
+    }
+    .kpi .label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+    .kpi .value {
+      margin-top: 6px;
+      font-size: 28px;
+      font-weight: 750;
+    }
+    .kpi .note {
+      margin-top: 4px;
+      color: var(--muted);
+      min-height: 20px;
+    }
+    .two-col {
+      grid-template-columns: minmax(0, 1.7fr) minmax(320px, 0.8fr);
+      align-items: start;
+    }
+    h2 {
+      margin: 0 0 12px;
+      font-size: 17px;
+    }
+    .chart-list {
+      display: grid;
+      gap: 8px;
+      max-height: 420px;
+      overflow: auto;
+      padding-right: 4px;
+    }
+    .bar-row {
+      display: grid;
+      grid-template-columns: 72px minmax(120px, 1fr) 58px;
+      gap: 8px;
+      align-items: center;
+    }
+    .bar-shell {
+      height: 20px;
+      background: #edf1f5;
+      border-radius: 6px;
+      overflow: hidden;
+      display: flex;
+    }
+    .bar-total {
+      display: flex;
+      height: 100%;
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .seg { height: 100%; min-width: 2px; }
+    .small {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .legend span {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .swatch {
+      width: 12px;
+      height: 12px;
+      border-radius: 3px;
+      display: inline-block;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 8px 9px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      background: #f9fbfd;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    .table-wrap {
+      max-height: 560px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 3px 8px;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .status.Clash { color: var(--danger); background: var(--danger-soft); }
+    .status.TBCGap { color: var(--warn); background: var(--warn-soft); }
+    .status.FullyLoaded { color: var(--full); background: var(--full-soft); }
+    .status.Available { color: var(--ok); background: var(--ok-soft); }
+    .tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 16px 0 10px;
+    }
+    .tab-btn {
+      border-color: var(--line);
+      background: #fff;
+    }
+    .tab-btn.active {
+      background: var(--accent-soft);
+      color: var(--accent);
+      border-color: #9ccfca;
+    }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .muted-box {
+      padding: 9px 11px;
+      border-radius: 7px;
+      background: #f9fbfd;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+    .assignment-select {
+      min-width: 150px;
+    }
+    .capacity-input {
+      width: 76px;
+    }
+    .fix-button {
+      white-space: nowrap;
+      min-height: 30px;
+      padding: 5px 8px;
+    }
+    .nowrap { white-space: nowrap; }
+    .right { text-align: right; }
+    @media (max-width: 1050px) {
+      .controls, .kpis, .two-col { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 700px) {
+      header, main { padding-left: 14px; padding-right: 14px; }
+      .controls, .kpis, .two-col { grid-template-columns: 1fr; }
+      .bar-row { grid-template-columns: 64px 1fr 48px; }
+      h1 { font-size: 21px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title-row">
+      <div>
+        <h1>T&C Resource Allocation Dashboard</h1>
+        <div class="subtitle" id="sourceMeta"></div>
+      </div>
+      <div class="button-row">
+        <button class="primary" id="saveBtn">Save Edits</button>
+        <button class="ghost" id="resetBtn">Reset</button>
+        <button class="ghost" id="issueCsvBtn">Download Issues CSV</button>
+        <button class="ghost" id="allocationCsvBtn">Download Edited Allocation CSV</button>
+      </div>
+    </div>
+    <div class="controls">
+      <label>Line
+        <select id="lineFilter"></select>
+      </label>
+      <label>Status
+        <select id="statusFilter">
+          <option>All</option>
+          <option>Clash</option>
+          <option>TBC Gap</option>
+          <option>Fully Loaded</option>
+          <option>Available</option>
+        </select>
+      </label>
+      <label>View
+        <select id="viewMode">
+          <option>Month</option>
+          <option>Week</option>
+        </select>
+      </label>
+      <label>Search
+        <input id="searchBox" type="search" placeholder="Person, role, activity">
+      </label>
+      <label>Displayed Rows
+        <select id="rowLimit">
+          <option value="120">120</option>
+          <option value="250" selected>250</option>
+          <option value="600">All</option>
+        </select>
+      </label>
+    </div>
+  </header>
+
+  <main>
+    <section class="grid kpis" id="kpis"></section>
+
+    <section class="grid two-col">
+      <div class="card">
+        <h2>Demand by Line</h2>
+        <div class="legend" id="legend"></div>
+        <div class="chart-list" id="demandChart"></div>
+      </div>
+      <div class="card">
+        <h2>Management Notes</h2>
+        <div id="managementNotes"></div>
+      </div>
+    </section>
+
+    <nav class="tabs" aria-label="Dashboard sections">
+      <button class="tab-btn active" data-tab="issues">Clash Detection</button>
+      <button class="tab-btn" data-tab="editor">Allocation Editor</button>
+      <button class="tab-btn" data-tab="people">Capacity Editor</button>
+      <button class="tab-btn" data-tab="lines">Line Summary</button>
+      <button class="tab-btn" data-tab="matrix">Test Matrix</button>
+    </nav>
+
+    <section class="panel active card" id="panel-issues">
+      <h2>Clash Detection and Suggested Fixes</h2>
+      <div class="muted-box" id="issueNote"></div>
+      <div class="table-wrap"><table id="issuesTable"></table></div>
+    </section>
+
+    <section class="panel card" id="panel-editor">
+      <h2>Editable Allocation Detail</h2>
+      <div class="muted-box" id="editorNote"></div>
+      <div class="table-wrap"><table id="editorTable"></table></div>
+    </section>
+
+    <section class="panel card" id="panel-people">
+      <h2>Editable Capacity</h2>
+      <div class="muted-box">Adjust max load to test adequacy. These edits update the clash calculation immediately in this browser.</div>
+      <div class="table-wrap"><table id="peopleTable"></table></div>
+    </section>
+
+    <section class="panel card" id="panel-lines">
+      <h2>Line Summary</h2>
+      <div class="table-wrap"><table id="lineTable"></table></div>
+    </section>
+
+    <section class="panel card" id="panel-matrix">
+      <h2>Test Type Matrix</h2>
+      <div class="table-wrap"><table id="matrixTable"></table></div>
+    </section>
+  </main>
+
+  <script>
+    const INITIAL_DATA = __DASHBOARD_DATA__;
+    const STORAGE_KEY = "tc-resource-dashboard-edits-v1";
+    const clone = (value) => JSON.parse(JSON.stringify(value));
+    const state = {
+      data: INITIAL_DATA,
+      rows: clone(INITIAL_DATA.detailRows || []),
+      people: clone(INITIAL_DATA.peopleRoster || []),
+      line: "All",
+      status: "All",
+      view: INITIAL_DATA.periodType || "Month",
+      search: "",
+      limit: 250,
+      activeTab: "issues"
+    };
+    let derived = null;
+
+    const lineColors = Object.assign({ DTL: "#2563eb", JRL: "#0f766e", CRL: "#d6a400", RTS: "#303b46" }, INITIAL_DATA.lineColors || {});
+
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+      }[char]));
+    }
+    function clean(value) {
+      return String(value ?? "").replace(/\s+/g, " ").trim();
+    }
+    function num(value, fallback = 0) {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : fallback;
+    }
+    function fmt(value, digits = 1) {
+      const n = num(value);
+      if (Math.abs(n - Math.round(n)) < 1e-9) return String(Math.round(n));
+      return n.toFixed(digits).replace(/\.0+$/, "");
+    }
+    function isTbcName(value) {
+      const text = clean(value).toUpperCase();
+      return !text || ["TBC", "TBD", "NA", "N/A"].includes(text) || text.includes("TBC");
+    }
+    function addUnique(list, item) {
+      if (item && !list.includes(item)) list.push(item);
+    }
+    function roleKeys(value) {
+      const text = clean(value).toUpperCase();
+      const keys = [];
+      if (!text) return keys;
+      if (text.includes("SUBCON") || /\bSC\b/.test(text)) addUnique(keys, "SUBCON");
+      if (text.includes("COMMS") || text.includes("NETWORK") || text.includes("RCS")) addUnique(keys, "COMMS T&C ENGINEER");
+      if (text.includes("TRAIN")) addUnique(keys, "TRAIN T&C ENGINEER");
+      if (text.includes("CSF")) addUnique(keys, "CSF T&C ENGINEER");
+      if (text.includes("SIG") || text.includes("IXL")) addUnique(keys, "SIG T&C ENGINEER");
+      if (text.includes("ATS")) addUnique(keys, "ATS T&C ENGINEER");
+      if (text.includes("ATC")) addUnique(keys, "ATC T&C ENGINEER");
+      if (text.includes("MANAGER")) addUnique(keys, "MANAGER");
+      if (text.includes("COORDINATOR")) addUnique(keys, "COORDINATOR");
+      if (text.includes("DESIGN")) addUnique(keys, "DESIGN ENGINEER");
+      if (!keys.length) addUnique(keys, text.replace(/\b\d+\b/g, "").replace(/\s+/g, " ").trim());
+      return keys.sort();
+    }
+    function preferredCompany(role) {
+      return roleKeys(role).includes("SUBCON") ? "SC" : "Siemens";
+    }
+    function statusClass(status) {
+      return clean(status).replace(/\s+/g, "");
+    }
+    function statusBadge(status) {
+      return `<span class="status ${statusClass(status)}">${esc(status)}</span>`;
+    }
+    function personKey(name) {
+      return clean(name).toUpperCase();
+    }
+    function peopleByName() {
+      const map = new Map();
+      for (const person of state.people) map.set(personKey(person.name), person);
+      return map;
+    }
+    function personOptions(selected) {
+      const selectedText = clean(selected) || "TBC";
+      const names = ["TBC", ...state.people.map((person) => person.name).sort((a, b) => a.localeCompare(b))];
+      return names.map((name) => `<option value="${esc(name)}"${clean(name) === selectedText ? " selected" : ""}>${esc(name)}</option>`).join("");
+    }
+    function rowLoads(row) {
+      const source = state.view === "Week" ? (row.weekLoads || row.periodLoads || []) : (row.monthLoads || row.periodLoads || []);
+      return source.length ? source : (row.periodLoads || []);
+    }
+    function rowPeakLoad(row, period) {
+      let total = 0;
+      for (const load of rowLoads(row)) {
+        if (!period || load.period === period || load.month === period) total += num(load.load);
+      }
+      return total;
+    }
+    function markRow(rowStates, rowId, status) {
+      const rank = { "Available": 0, "Fully Loaded": 1, "TBC Gap": 2, "Clash": 3 };
+      const current = rowStates.get(rowId) || "Available";
+      if ((rank[status] ?? 0) > (rank[current] ?? 0)) rowStates.set(rowId, status);
+    }
+    function makeSuggestion(issue, loadIndex) {
+      const targetKeys = roleKeys(issue.role);
+      const targetLabel = targetKeys.length ? targetKeys.join("/") : "matching role";
+      const preferred = preferredCompany(issue.role);
+      const needed = issue.status === "Clash" ? num(issue.excessLoad) : num(issue.load);
+      const candidates = [];
+      for (const person of state.people) {
+        if (personKey(person.name) === personKey(issue.assigned)) continue;
+        const pKeys = (person.roleKeys && person.roleKeys.length) ? person.roleKeys : roleKeys(person.role || person.roleKey || "");
+        if (targetKeys.length && !pKeys.some((key) => targetKeys.includes(key))) continue;
+        const currentLoad = loadIndex.get(`${personKey(person.name)}|${issue.period}`) || 0;
+        const maxLoad = num(person.maxWeeklyLoad, 1);
+        const capacity = maxLoad - currentLoad;
+        if (capacity <= 1e-9) continue;
+        const lineMatch = issue.line && (person.lines || []).includes(issue.line) ? 1 : 0;
+        const companyMatch = preferred && clean(person.company) === preferred ? 1 : 0;
+        const matched = pKeys.filter((key) => targetKeys.includes(key));
+        candidates.push({ person, capacity, lineMatch, companyMatch, matched });
+      }
+      candidates.sort((a, b) => b.companyMatch - a.companyMatch || b.lineMatch - a.lineMatch || b.capacity - a.capacity || a.person.name.localeCompare(b.person.name));
+      if (candidates.length) {
+        const best = candidates[0];
+        const roleText = best.matched.length ? best.matched.join("/") : clean(best.person.roleKey || best.person.role || "");
+        const qualifier = [roleText, clean(best.person.line || "")].filter(Boolean).join(", ");
+        const suffix = qualifier ? ` (${qualifier})` : "";
+        if (best.capacity + 1e-9 >= needed) {
+          const action = issue.status === "TBC Gap" ? "Assign" : "Move";
+          const canApply = canApplyCandidate(issue, best.person.name, loadIndex);
+          return {
+            text: `${action} ${fmt(needed, 2)} load to ${best.person.name}${suffix}; ${fmt(best.capacity, 2)} capacity available in ${issue.label}.${canApply ? "" : " Check other loaded periods before editing this row."}`,
+            candidate: canApply ? best.person.name : "",
+            needed
+          };
+        }
+        return {
+          text: `Split: ${best.person.name}${suffix} can take ${fmt(best.capacity, 2)} in ${issue.label}; add another ${targetLabel} resource or shift ${fmt(Math.max(needed - best.capacity, 0), 2)} load.`,
+          candidate: "",
+          needed
+        };
+      }
+      const action = issue.status === "Clash" ? `add ${fmt(needed, 2)} load or move one activity to another period` : `assign a new person or shift ${fmt(needed, 2)} load`;
+      return { text: `No spare ${targetLabel} capacity found in ${issue.label}; ${action}.`, candidate: "", needed };
+    }
+    function rowsForIssueApply(issue) {
+      let remaining = num(issue.needed || issue.excessLoad || issue.load);
+      const rows = state.rows
+        .filter((row) => (issue.rowIds || []).includes(row.rowId))
+        .sort((a, b) => rowPeakLoad(b, issue.period) - rowPeakLoad(a, issue.period));
+      const selected = [];
+      for (const row of rows) {
+        if (remaining <= 1e-9) break;
+        selected.push(row);
+        remaining -= Math.max(rowPeakLoad(row, issue.period), 0.1);
+      }
+      return selected;
+    }
+    function canApplyCandidate(issue, candidate, loadIndex) {
+      if (!candidate) return false;
+      const person = peopleByName().get(personKey(candidate));
+      if (!person) return false;
+      const maxLoad = num(person.maxWeeklyLoad, 1);
+      const selectedRows = rowsForIssueApply(issue);
+      if (!selectedRows.length) return false;
+      for (const row of selectedRows) {
+        for (const load of rowLoads(row)) {
+          const amount = num(load.load);
+          if (amount <= 0) continue;
+          const period = load.period || load.month || "";
+          const current = loadIndex.get(`${personKey(candidate)}|${period}`) || 0;
+          if (current + amount > maxLoad + 1e-9) return false;
+        }
+      }
+      return true;
+    }
+    function computeDerived() {
+      const byName = peopleByName();
+      const groups = new Map();
+      const loadIndex = new Map();
+      const rowStates = new Map();
+      const issues = [];
+      for (const row of state.rows) {
+        const assigned = clean(row.assigned) || "TBC";
+        const person = byName.get(personKey(assigned));
+        const company = isTbcName(assigned) ? "TBC" : clean(person?.company || row.company || "Unknown");
+        row.company = company;
+        for (const load of rowLoads(row)) {
+          const amount = num(load.load);
+          if (amount <= 0) continue;
+          const period = load.period || load.month || "";
+          const label = load.periodLabel || load.monthLabel || period;
+          if (isTbcName(assigned)) {
+            const issue = {
+              status: "TBC Gap",
+              assigned: "TBC",
+              company: "TBC",
+              period,
+              label,
+              month: period,
+              monthLabel: label,
+              role: clean(row.role),
+              line: clean(row.line),
+              testType: clean(row.testType),
+              activity: clean(row.activity),
+              load: amount,
+              threshold: 1,
+              excessLoad: amount,
+              rowIds: [row.rowId],
+              rowId: row.rowId
+            };
+            issues.push(issue);
+            markRow(rowStates, row.rowId, "TBC Gap");
+            continue;
+          }
+          const key = `${personKey(assigned)}|${period}`;
+          if (!groups.has(key)) {
+            groups.set(key, {
+              assigned,
+              company,
+              period,
+              label,
+              load: 0,
+              roles: new Set(),
+              lines: new Set(),
+              rowIds: new Set(),
+              rows: []
+            });
+          }
+          const group = groups.get(key);
+          group.load += amount;
+          group.roles.add(clean(row.role));
+          group.lines.add(clean(row.line));
+          group.rowIds.add(row.rowId);
+          group.rows.push(row);
+        }
+      }
+      const personLoads = [];
+      for (const group of groups.values()) {
+        const person = byName.get(personKey(group.assigned));
+        const threshold = num(person?.maxWeeklyLoad, 1);
+        const status = group.load > threshold + 1e-9 ? "Clash" : (Math.abs(group.load - threshold) <= 1e-9 ? "Fully Loaded" : "Available");
+        const lineList = [...group.lines].filter(Boolean).sort();
+        const record = {
+          status,
+          assigned: group.assigned,
+          company: group.company,
+          period: group.period,
+          label: group.label,
+          month: group.period,
+          monthLabel: group.label,
+          role: [...group.roles].filter(Boolean).sort().slice(0, 4).join(", "),
+          line: lineList.length === 1 ? lineList[0] : "",
+          lines: lineList.join(", "),
+          load: group.load,
+          threshold,
+          excessLoad: Math.max(group.load - threshold, 0),
+          rowIds: [...group.rowIds]
+        };
+        personLoads.push(record);
+        loadIndex.set(`${personKey(group.assigned)}|${group.period}`, group.load);
+        for (const row of group.rows) markRow(rowStates, row.rowId, status);
+        if (status === "Clash") issues.push(record);
+      }
+      for (const row of state.rows) {
+        if (!rowStates.has(row.rowId)) rowStates.set(row.rowId, "Available");
+      }
+      for (const issue of issues) {
+        const suggestion = makeSuggestion(issue, loadIndex);
+        issue.suggestedFix = suggestion.text;
+        issue.candidate = suggestion.candidate;
+        issue.needed = suggestion.needed;
+      }
+      issues.sort((a, b) => {
+        const statusRank = { "Clash": 0, "TBC Gap": 1 };
+        return (a.period || "").localeCompare(b.period || "") ||
+          (statusRank[a.status] ?? 9) - (statusRank[b.status] ?? 9) ||
+          num(b.excessLoad) - num(a.excessLoad) ||
+          clean(a.assigned).localeCompare(clean(b.assigned));
+      });
+      personLoads.sort((a, b) => (a.period || "").localeCompare(b.period || "") || clean(a.assigned).localeCompare(clean(b.assigned)));
+      return { issues, personLoads, rowStates, loadIndex };
+    }
+    function filteredRows() {
+      const query = state.search.toLowerCase();
+      return state.rows.filter((row) => {
+        const status = derived.rowStates.get(row.rowId) || "Available";
+        if (state.line !== "All" && row.line !== state.line) return false;
+        if (state.status !== "All" && status !== state.status) return false;
+        if (!query) return true;
+        return [row.assigned, row.role, row.activity, row.testType, row.line].join(" ").toLowerCase().includes(query);
+      });
+    }
+    function filteredIssues() {
+      const query = state.search.toLowerCase();
+      return derived.issues.filter((issue) => {
+        if (state.line !== "All" && issue.line && issue.line !== state.line) return false;
+        if (state.status !== "All" && issue.status !== state.status) return false;
+        if (!query) return true;
+        return [issue.assigned, issue.role, issue.activity, issue.testType, issue.line, issue.suggestedFix].join(" ").toLowerCase().includes(query);
+      });
+    }
+    function renderKpis() {
+      const summary = state.data.summary || {};
+      const namedClashes = derived.issues.filter((x) => x.status === "Clash").length;
+      const tbcGaps = derived.issues.filter((x) => x.status === "TBC Gap").length;
+      const fullyLoaded = derived.personLoads.filter((x) => x.status === "Fully Loaded").length;
+      const available = derived.personLoads.filter((x) => x.status === "Available").length;
+      const adequacy = namedClashes ? "Action needed" : (tbcGaps ? "TBC open" : "Adequate");
+      const cards = [
+        ["Peak Demand", fmt(summary.peakDemand), summary.peakMonth || ""],
+        ["Named Clashes", fmt(namedClashes, 0), "Over threshold"],
+        ["TBC Gaps", fmt(tbcGaps, 0), "Unassigned load rows"],
+        ["Fully Loaded", fmt(fullyLoaded, 0), "At max load"],
+        ["Available", fmt(available, 0), "Below max load"],
+        ["Adequacy", adequacy, `${fmt(summary.totalManpower || state.people.length, 0)} people in roster`]
+      ];
+      document.getElementById("kpis").innerHTML = cards.map(([label, value, note]) => `
+        <div class="card kpi">
+          <div class="label">${esc(label)}</div>
+          <div class="value">${esc(value)}</div>
+          <div class="note">${esc(note)}</div>
+        </div>`).join("");
+    }
+    function renderDemandChart() {
+      const rows = (state.data.demandRowsByView || {})[state.view] || state.data.demandRows || [];
+      const lines = state.line === "All" ? (state.data.lines || []) : [state.line];
+      const maxTotal = Math.max(1, ...rows.map((row) => lines.reduce((sum, line) => sum + num(row[line]), 0)));
+      document.getElementById("legend").innerHTML = lines.map((line) => `<span><i class="swatch" style="background:${lineColors[line] || "#999"}"></i>${esc(line)}</span>`).join("");
+      document.getElementById("demandChart").innerHTML = rows.map((row) => {
+        const total = lines.reduce((sum, line) => sum + num(row[line]), 0);
+        const totalWidth = Math.max(1, Math.min(100, (total / maxTotal) * 100));
+        const segs = lines.map((line) => {
+          const value = num(row[line]);
+          const width = total ? (value / total) * 100 : 0;
+          return `<div class="seg" title="${esc(line)} ${fmt(value)}" style="width:${width}%; background:${lineColors[line] || "#999"}"></div>`;
+        }).join("");
+        return `<div class="bar-row">
+          <div class="small nowrap">${esc(row.label)}</div>
+          <div class="bar-shell"><div class="bar-total" style="width:${totalWidth}%">${segs}</div></div>
+          <div class="small right">${fmt(total)}</div>
+        </div>`;
+      }).join("");
+    }
+    function renderNotes() {
+      const metrics = state.data.lineMetrics || [];
+      const summary = state.data.summary || {};
+      const worst = [...metrics].sort((a, b) => num(b.gap) - num(a.gap))[0];
+      const topIssue = derived.issues[0];
+      const notes = [
+        `<strong>Source:</strong> ${esc(summary.source || "")} (${esc(summary.sourceMode || "")})`,
+        `<strong>Rows counted:</strong> ${fmt(summary.resourceRows || 0, 0)} allocation rows and ${fmt(summary.monthlyRows || 0, 0)} period load records.`,
+        worst ? `<strong>Largest line gap:</strong> ${esc(worst.line)} peaks at ${fmt(worst.peakDemand)} vs ${fmt(worst.available)} available (${esc(worst.peakMonth)}).` : "",
+        topIssue ? `<strong>First action:</strong> ${esc(topIssue.status)} for ${esc(topIssue.assigned)} in ${esc(topIssue.label)}. ${esc(topIssue.suggestedFix)}` : "<strong>Status:</strong> No open issues after current edits."
+      ].filter(Boolean);
+      document.getElementById("managementNotes").innerHTML = notes.map((note) => `<p>${note}</p>`).join("");
+    }
+    function renderIssues() {
+      const rows = filteredIssues();
+      document.getElementById("issueNote").textContent = `${rows.length} issue rows after filters. Use Apply to test the suggested reassignment in the editable allocation table.`;
+      const limited = rows.slice(0, state.limit);
+      document.getElementById("issuesTable").innerHTML = `
+        <thead><tr>
+          <th>Status</th><th>Period</th><th>Person</th><th>Line</th><th>Role</th><th class="right">Load</th><th class="right">Max</th><th>Suggested Fix</th><th></th>
+        </tr></thead>
+        <tbody>${limited.map((issue, index) => `
+          <tr>
+            <td>${statusBadge(issue.status)}</td>
+            <td class="nowrap">${esc(issue.label)}</td>
+            <td>${esc(issue.assigned)}</td>
+            <td>${esc(issue.line || issue.lines || "")}</td>
+            <td>${esc(issue.role)}</td>
+            <td class="right">${fmt(issue.load, 2)}</td>
+            <td class="right">${fmt(issue.threshold, 2)}</td>
+            <td>${esc(issue.suggestedFix)}</td>
+            <td>${issue.candidate ? `<button class="fix-button" data-apply-issue="${index}">Apply</button>` : ""}</td>
+          </tr>`).join("")}</tbody>`;
+      document.querySelectorAll("[data-apply-issue]").forEach((button) => {
+        button.addEventListener("click", () => applyIssue(limited[num(button.dataset.applyIssue)]));
+      });
+    }
+    function renderEditor() {
+      const rows = filteredRows();
+      const limited = rows.slice(0, state.limit);
+      document.getElementById("editorNote").textContent = `Showing ${limited.length} of ${rows.length} filtered allocation rows. Assignment edits recalculate all clash and TBC statuses immediately.`;
+      document.getElementById("editorTable").innerHTML = `
+        <thead><tr>
+          <th>Status</th><th>Line</th><th>Test Type</th><th>Activity</th><th>Role</th><th>Assigned</th><th>Periods</th><th class="right">Peak Load</th>
+        </tr></thead>
+        <tbody>${limited.map((row) => {
+          const status = derived.rowStates.get(row.rowId) || "Available";
+          const periods = rowLoads(row).map((load) => `${load.periodLabel || load.monthLabel}: ${fmt(load.load, 2)}`).join(", ");
+          return `<tr>
+            <td>${statusBadge(status)}</td>
+            <td>${esc(row.line)}</td>
+            <td>${esc(row.testType)}</td>
+            <td>${esc(row.activity)}</td>
+            <td>${esc(row.role)}</td>
+            <td><select class="assignment-select" data-assign-row="${esc(row.rowId)}">${personOptions(row.assigned)}</select></td>
+            <td class="small">${esc(periods)}</td>
+            <td class="right">${fmt(Math.max(0, ...rowLoads(row).map((load) => num(load.load))), 2)}</td>
+          </tr>`;
+        }).join("")}</tbody>`;
+      document.querySelectorAll("[data-assign-row]").forEach((select) => {
+        select.addEventListener("change", () => {
+          const row = state.rows.find((item) => item.rowId === select.dataset.assignRow);
+          if (!row) return;
+          row.assigned = select.value;
+          const person = peopleByName().get(personKey(select.value));
+          row.company = isTbcName(select.value) ? "TBC" : clean(person?.company || "Unknown");
+          renderAll();
+        });
+      });
+    }
+    function renderPeople() {
+      document.getElementById("peopleTable").innerHTML = `
+        <thead><tr><th>Name</th><th>Company</th><th>Line</th><th>Role</th><th>Role Keys</th><th class="right">Max Load</th></tr></thead>
+        <tbody>${state.people.map((person) => `
+          <tr>
+            <td>${esc(person.name)}</td>
+            <td>${esc(person.company)}</td>
+            <td>${esc(person.line || "")}</td>
+            <td>${esc(person.role || "")}</td>
+            <td>${esc((person.roleKeys || []).join(", "))}</td>
+            <td class="right"><input class="capacity-input" type="number" min="0" step="0.1" value="${esc(person.maxWeeklyLoad ?? 1)}" data-max-person="${esc(person.name)}"></td>
+          </tr>`).join("")}</tbody>`;
+      document.querySelectorAll("[data-max-person]").forEach((input) => {
+        input.addEventListener("change", () => {
+          const person = state.people.find((item) => item.name === input.dataset.maxPerson);
+          if (!person) return;
+          person.maxWeeklyLoad = Math.max(0, num(input.value, 1));
+          renderAll();
+        });
+      });
+    }
+    function renderLines() {
+      const rows = state.data.lineMetrics || [];
+      document.getElementById("lineTable").innerHTML = `
+        <thead><tr><th>Line</th><th class="right">Peak Demand</th><th>Peak Period</th><th class="right">Available</th><th class="right">Gap</th><th class="right">TBC Rows</th><th>Driver</th></tr></thead>
+        <tbody>${rows.map((row) => `
+          <tr>
+            <td>${esc(row.line)}</td><td class="right">${fmt(row.peakDemand)}</td><td>${esc(row.peakMonth)}</td><td class="right">${fmt(row.available)}</td><td class="right">${fmt(row.gap)}</td><td class="right">${fmt(row.tbcRows, 0)}</td><td>${esc(row.why)}</td>
+          </tr>`).join("")}</tbody>`;
+    }
+    function renderMatrix() {
+      const rows = state.data.testLineMatrix || [];
+      const lines = state.data.lines || [];
+      document.getElementById("matrixTable").innerHTML = `
+        <thead><tr><th>Test Type</th>${lines.map((line) => `<th class="right">${esc(line)}</th>`).join("")}<th class="right">Total Peak</th></tr></thead>
+        <tbody>${rows.map((row) => `
+          <tr><td>${esc(row.testType)}</td>${lines.map((line) => `<td class="right">${fmt(row[line])}</td>`).join("")}<td class="right">${fmt(row.totalPeak)}</td></tr>`).join("")}</tbody>`;
+    }
+    function renderAll() {
+      derived = computeDerived();
+      renderKpis();
+      renderDemandChart();
+      renderNotes();
+      renderIssues();
+      renderEditor();
+      renderPeople();
+      renderLines();
+      renderMatrix();
+    }
+    function applyIssue(issue) {
+      if (!issue || !issue.candidate) return;
+      if (!canApplyCandidate(issue, issue.candidate, derived.loadIndex)) {
+        alert("This recommendation affects other loaded periods. Please review and edit the allocation row manually.");
+        return;
+      }
+      let remaining = num(issue.needed || issue.excessLoad || issue.load);
+      const rows = rowsForIssueApply(issue);
+      for (const row of rows) {
+        if (remaining <= 1e-9) break;
+        row.assigned = issue.candidate;
+        const person = peopleByName().get(personKey(issue.candidate));
+        row.company = clean(person?.company || "Unknown");
+        remaining -= Math.max(rowPeakLoad(row, issue.period), 0.1);
+      }
+      renderAll();
+    }
+    function saveEdits() {
+      const assignments = {};
+      for (const row of state.rows) assignments[row.rowId] = { assigned: row.assigned, company: row.company };
+      const capacities = {};
+      for (const person of state.people) capacities[person.name] = person.maxWeeklyLoad;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ assignments, capacities }));
+    }
+    function loadEdits() {
+      try {
+        const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+        if (saved.assignments) {
+          for (const row of state.rows) {
+            if (saved.assignments[row.rowId]) Object.assign(row, saved.assignments[row.rowId]);
+          }
+        }
+        if (saved.capacities) {
+          for (const person of state.people) {
+            if (saved.capacities[person.name] !== undefined) person.maxWeeklyLoad = saved.capacities[person.name];
+          }
+        }
+      } catch (error) {
+        console.warn("Could not load saved dashboard edits", error);
+      }
+    }
+    function resetEdits() {
+      localStorage.removeItem(STORAGE_KEY);
+      state.rows = clone(INITIAL_DATA.detailRows || []);
+      state.people = clone(INITIAL_DATA.peopleRoster || []);
+      renderAll();
+    }
+    function toCsv(rows, columns) {
+      const quote = (value) => `"${String(value ?? "").replace(/"/g, '""')}"`;
+      return [columns.map(quote).join(","), ...rows.map((row) => columns.map((col) => quote(row[col])).join(","))].join("\n");
+    }
+    function download(name, text, type = "text/csv") {
+      const blob = new Blob([text], { type });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = name;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+    function downloadIssues() {
+      const rows = derived.issues.map((issue) => ({
+        status: issue.status,
+        period: issue.label,
+        assigned: issue.assigned,
+        line: issue.line || issue.lines || "",
+        role: issue.role,
+        load: fmt(issue.load, 2),
+        threshold: fmt(issue.threshold, 2),
+        excessLoad: fmt(issue.excessLoad, 2),
+        suggestedFix: issue.suggestedFix
+      }));
+      download("resource_allocation_issues.csv", toCsv(rows, ["status", "period", "assigned", "line", "role", "load", "threshold", "excessLoad", "suggestedFix"]));
+    }
+    function downloadAllocation() {
+      const rows = state.rows.map((row) => ({
+        rowId: row.rowId,
+        sourceRow: row.sourceRow,
+        status: derived.rowStates.get(row.rowId) || "Available",
+        line: row.line,
+        testType: row.testType,
+        activity: row.activity,
+        role: row.role,
+        assigned: row.assigned,
+        company: row.company,
+        start: row.start,
+        finish: row.finish,
+        requirement: row.requirement
+      }));
+      download("edited_resource_allocation.csv", toCsv(rows, ["rowId", "sourceRow", "status", "line", "testType", "activity", "role", "assigned", "company", "start", "finish", "requirement"]));
+    }
+    function initControls() {
+      document.getElementById("sourceMeta").textContent = `${state.data.summary?.source || "Workbook"} - ${state.data.summary?.sourceMode || ""}`;
+      const lineFilter = document.getElementById("lineFilter");
+      lineFilter.innerHTML = ["All", ...(state.data.lines || [])].map((line) => `<option>${esc(line)}</option>`).join("");
+      document.getElementById("viewMode").value = state.view;
+      lineFilter.addEventListener("change", () => { state.line = lineFilter.value; renderAll(); });
+      document.getElementById("statusFilter").addEventListener("change", (event) => { state.status = event.target.value; renderAll(); });
+      document.getElementById("viewMode").addEventListener("change", (event) => { state.view = event.target.value; renderAll(); });
+      document.getElementById("searchBox").addEventListener("input", (event) => { state.search = event.target.value; renderAll(); });
+      document.getElementById("rowLimit").addEventListener("change", (event) => { state.limit = num(event.target.value, 250); renderAll(); });
+      document.getElementById("saveBtn").addEventListener("click", saveEdits);
+      document.getElementById("resetBtn").addEventListener("click", resetEdits);
+      document.getElementById("issueCsvBtn").addEventListener("click", downloadIssues);
+      document.getElementById("allocationCsvBtn").addEventListener("click", downloadAllocation);
+      document.querySelectorAll("[data-tab]").forEach((button) => {
+        button.addEventListener("click", () => {
+          state.activeTab = button.dataset.tab;
+          document.querySelectorAll(".tab-btn").forEach((btn) => btn.classList.toggle("active", btn.dataset.tab === state.activeTab));
+          document.querySelectorAll(".panel").forEach((panel) => panel.classList.toggle("active", panel.id === `panel-${state.activeTab}`));
+        });
+      });
+    }
+    loadEdits();
+    initControls();
+    renderAll();
+  </script>
+</body>
+</html>"""
+
 
 # ==========================================
 # STREAMLIT DASHBOARD UI
 # ==========================================
 def run_streamlit_app():
+    if st is None or px is None:
+        raise RuntimeError("Streamlit and Plotly are not installed. Use --static to generate the standalone HTML dashboard.")
     st.set_page_config(page_title="T&C Manpower Allocation", layout="wide")
 
     # --- 1. SIDEBAR CONTROLS ---
@@ -2058,5 +3164,43 @@ def run_streamlit_app():
         else:
             st.write("No detail rows match your filters.")
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Build T&C resource allocation dashboard outputs.")
+    parser.add_argument(
+        "--workbook",
+        default=str(Path.home() / "Downloads" / "Resource Planning 1-ET updates.xlsx"),
+        help="Path to the resource planning workbook.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=str(APP_DIR.parent / "outputs"),
+        help="Directory for generated dashboard/report outputs.",
+    )
+    parser.add_argument(
+        "--streamlit",
+        action="store_true",
+        help="Launch the Streamlit app instead of generating static outputs.",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.streamlit:
+        run_streamlit_app()
+        return
+    outputs = generate_outputs(args.workbook, args.output_dir)
+    summary = outputs["payload"].get("summary", {})
+    print(f"Dashboard: {outputs['html']}")
+    print(f"Excel report: {outputs['report']}")
+    print(f"Patched code: {outputs['code']}")
+    print(
+        "Summary: "
+        f"{summary.get('resourceRows', 0)} allocation rows, "
+        f"{summary.get('personClashes', 0)} named clashes, "
+        f"{summary.get('tbcGaps', 0)} TBC gaps."
+    )
+
+
 if __name__ == "__main__":
-    run_streamlit_app()
+    main()
